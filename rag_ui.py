@@ -1,8 +1,6 @@
 import streamlit as st
 from pathlib import Path
-import subprocess
-import sys
-import textwrap
+import subprocess, sys, textwrap
 import chromadb
 from chromadb.config import Settings
 import ollama
@@ -33,7 +31,7 @@ LANG_PROMPTS = {
 }
 
 # ---------------- Hilfsfunktionen ----------------
-def format_context(results, max_chars=12000, show_dist=False):
+def format_context(results, max_chars=16000, show_dist=False):
     if not results or not results.get("documents") or not results["documents"][0]:
         return ""
     docs = results["documents"][0]
@@ -69,7 +67,6 @@ def auto_lang_from_meta(client, collection_name: str) -> str:
     return "generic"
 
 def run_index_subprocess(python_exe: str, script_path: Path, args: list[str]):
-    """Startet den Indexer als Subprozess und streamt stdout/err."""
     proc = subprocess.Popen(
         [python_exe, str(script_path), *args],
         stdout=subprocess.PIPE,
@@ -86,6 +83,7 @@ def run_index_subprocess(python_exe: str, script_path: Path, args: list[str]):
 st.set_page_config(page_title="Ollama Code Assistant", page_icon="💬", layout="wide")
 st.title("💬 Code Assistant mit Ollama (RAG)")
 
+# Sidebar: Settings
 with st.sidebar:
     st.header("🔧 Einstellungen")
     db_path = st.text_input("Pfad zur ChromaDB", value="./chroma_db")
@@ -115,131 +113,140 @@ with st.sidebar:
     model = st.selectbox("Antwort-Modell", ["deepseek-r1:8b", "gpt-oss:20b", "llama3.1:8b"], index=0)
     embed_model = st.text_input("Embeddings-Modell", value="nomic-embed-text")
 
+    # Retrieval-Parameter
     topk = st.slider("Top-K Snippets", 1, 30, 20)
     max_chars = st.slider("Max Kontext-Zeichen", 2000, 30000, 16000, step=1000)
     show_dist = st.checkbox("Ähnlichkeitswerte anzeigen", value=False)
     show_ctx_box = st.checkbox("Verwendete Snippets anzeigen", value=True)
 
-# Query-Eingabe
-frage = st.text_area("Frage zur Codebasis", placeholder="Wie wird das Login validiert?")
-
-col_run1, col_run2, col_run3 = st.columns([1,1,1])
-with col_run1:
-    go = st.button("Antwort abrufen", type="primary")
-with col_run2:
-    ping = st.button("Embeddings testen")
-with col_run3:
-    st.write("")  # spacer
-
-if ping:
-    try:
-        emb = ollama.embeddings(model=embed_model, prompt="ping").get("embedding", [])
-        st.success(f"Embeddings OK (len={len(emb)})")
-    except Exception as e:
-        st.error(f"Embedding-Test fehlgeschlagen: {e}")
-
-# ---------------- Reindex-Sektion ----------------
-st.divider()
-st.subheader("🧱 Index neu aufbauen / aktualisieren")
-
-re_col1, re_col2, re_col3 = st.columns([2,1,1])
-with re_col1:
-    repo_path = st.text_input("Repo-Pfad (Ordner der Codebasis)", value="")
-with re_col2:
-    project_name = st.text_input("Projektname (Collection)", value=collection or "cpp_repo")
-with re_col3:
-    index_lang = st.selectbox("Sprache fürs Indexing", ["php", "cpp", "generic"],
-                              index=["php","cpp","generic"].index(lang) if lang in ("php","cpp","generic") else 2)
-
-idx_go = st.button("Index aufbauen/aktualisieren")
-
-if idx_go:
-    if not repo_path.strip():
-        st.warning("Bitte Repo-Pfad angeben.")
-    else:
-        # Entscheide, welchen Indexer wir starten
-        index_script = Path("index_cpp.py" if index_lang == "cpp" else "index_repo.py")
-        if not index_script.exists():
-            st.error(f"{index_script.name} nicht gefunden neben rag_ui.py.")
-        else:
-            # Vorab: Embeddings-Ping (nützlich, um sofortiges Hängen zu vermeiden)
-            try:
-                _ = ollama.embeddings(model="nomic-embed-text", prompt="ping")["embedding"]
-            except Exception as e:
-                st.error(f"Embeddings nicht verfügbar (Ollama läuft/Modell geladen?): {e}")
-                st.stop()
-
-            cmd_args = [
-                "--repo", repo_path,
-                "--db", str(Path(db_path)),
-                "--project", project_name,
-                "--lang", index_lang,
-            ]
-            # Falls du im PHP-Indexer noch --collection verwendest, ist --project vorrangig und setzt die Collection.
-
-            st.info(f"Starte {index_script.name} …")
-            log_box = st.empty()
-            log_lines = []
-
-            for line in run_index_subprocess(sys.executable, index_script, cmd_args):
-                log_lines.append(line)
-                # zeige nur die letzten ~200 Zeilen
-                log_box.code("\n".join(log_lines[-200:]), language="text")
-
-            st.success("Indexing abgeschlossen. Dropdown oben ggf. neu öffnen/wechseln, um die Collection zu sehen.")
-
-# ---------------- Frage ausführen ----------------
-if go:
-    if not client:
-        st.error("Keine Chroma-Verbindung.")
-    elif not frage.strip():
-        st.warning("Bitte gib eine Frage ein.")
-    else:
+    # Embedding-Ping
+    if st.button("Embeddings testen"):
         try:
-            with st.spinner("Suche relevante Snippets…"):
-                coll = client.get_or_create_collection(collection)
-                q_emb = ollama.embeddings(model=embed_model, prompt=frage)["embedding"]
-                results = coll.query(
-                    query_embeddings=[q_emb],
-                    n_results=topk,
-                    include=["documents", "metadatas", "distances"]
-                )
-                ctx = format_context(results, max_chars=max_chars, show_dist=show_dist)
-
-            if not ctx.strip():
-                st.info("Keine passenden Snippets gefunden. Versuche eine spezifischere Frage oder erhöhe Top‑K.")
-            else:
-                if show_ctx_box:
-                    code_lang = "php" if lang == "php" else "cpp" if lang == "cpp" else "text"
-                    with st.expander("🔎 Verwendete Snippets (Kontext)"):
-                        st.code(ctx, language=code_lang)
-
-                system_prompt = LANG_PROMPTS.get(lang, LANG_PROMPTS["generic"])
-                user_prompt = textwrap.dedent(f"""
-                Beantworte die folgende Frage zur Codebasis mithilfe des Kontexts.
-
-                ### Kontext (Snippets mit Pfaden und Zeilen)
-                {ctx}
-
-                ### Frage
-                {frage}
-
-                ### Anforderungen
-                - Begründe kurz deine Antwort.
-                - Zitiere IMMER Pfad + Zeilen.
-                - Wenn Codeänderungen nötig sind: zeige konkrete Patches (Diff-ähnlich) oder Code-Auszüge.
-                """)
-
-                with st.spinner(f"Frage {model}…"):
-                    msgs = [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ]
-                    resp = ollama.chat(model=model, messages=msgs)
-
-                st.subheader("Antwort")
-                st.markdown(resp["message"]["content"])
-
+            emb = ollama.embeddings(model=embed_model, prompt="ping").get("embedding", [])
+            st.success(f"Embeddings OK (len={len(emb)})")
         except Exception as e:
-            st.error(f"Fehler: {e}")
-            st.stop()
+            st.error(f"Embedding-Test fehlgeschlagen: {e}")
+
+# --------- Chat State ---------
+if "messages" not in st.session_state:
+    st.session_state.messages = []  # list[dict(role, content)]
+if "last_ctx" not in st.session_state:
+    st.session_state.last_ctx = ""  # zuletzt verwendeter Kontext (optional sichtbar)
+
+# Chatverlauf rendern
+for m in st.session_state.messages:
+    with st.chat_message(m["role"]):
+        st.markdown(m["content"])
+
+# Chat-Eingabe (wie ChatGPT)
+user_input = st.chat_input("Frage zur Codebasis eingeben…")
+if user_input:
+    # 1) User-Post in Verlauf
+    st.session_state.messages.append({"role": "user", "content": user_input})
+    with st.chat_message("user"):
+        st.markdown(user_input)
+
+    # 2) Retrieval + Antwort erzeugen
+    try:
+        with st.spinner("Suche relevante Snippets…"):
+            if not client:
+                st.error("Keine Chroma-Verbindung.")
+                st.stop()
+            coll = client.get_or_create_collection(collection)
+            q_emb = ollama.embeddings(model=embed_model, prompt=user_input)["embedding"]
+            results = coll.query(
+                query_embeddings=[q_emb],
+                n_results=topk,
+                include=["documents", "metadatas", "distances"]
+            )
+            ctx = format_context(results, max_chars=max_chars, show_dist=show_dist)
+            st.session_state.last_ctx = ctx  # speichern für optionalen Blick
+
+        if not ctx.strip():
+            assistant_text = "Ich habe keine passenden Snippets gefunden. Versuche eine spezifischere Frage oder erhöhe die Anzahl Top‑K."
+        else:
+            if show_ctx_box:
+                with st.expander("🔎 Verwendete Snippets (Kontext)"):
+                    code_lang = "php" if lang == "php" else "cpp" if lang == "cpp" else "text"
+                    st.code(ctx, language=code_lang)
+
+            system_prompt = LANG_PROMPTS.get(lang, LANG_PROMPTS["generic"])
+            user_prompt = textwrap.dedent(f"""
+            Beantworte die folgende Frage zur Codebasis mithilfe des Kontexts.
+
+            ### Kontext (Snippets mit Pfaden und Zeilen)
+            {ctx}
+
+            ### Frage
+            {user_input}
+
+            ### Anforderungen
+            - Begründe kurz deine Antwort.
+            - Zitiere IMMER Pfad + Zeilen.
+            - Wenn Codeänderungen nötig sind: zeige konkrete Patches (Diff-ähnlich) oder Code-Auszüge.
+            """)
+
+            with st.spinner(f"Frage {model}…"):
+                msgs = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ]
+                resp = ollama.chat(model=model, messages=msgs)
+            assistant_text = resp["message"]["content"]
+
+        # 3) Assistant-Post in Verlauf + rendern
+        st.session_state.messages.append({"role": "assistant", "content": assistant_text})
+        with st.chat_message("assistant"):
+            st.markdown(assistant_text)
+
+    except Exception as e:
+        st.error(f"Fehler: {e}")
+
+# --------- Reindex-Sektion (default hidden) ---------
+with st.expander("🧱 Index neu aufbauen / aktualisieren (Advanced)", expanded=False):
+    st.caption("Für seltene Neu-Indexierungen – standardmäßig ausgeblendet.")
+    col1, col2, col3 = st.columns([2,1,1])
+    with col1:
+        repo_path = st.text_input("Repo-Pfad (Ordner der Codebasis)", value="", key="repo_path")
+    with col2:
+        project_name = st.text_input("Projektname (Collection)", value=collection or "cpp_repo", key="project_name")
+    with col3:
+        index_lang = st.selectbox("Sprache fürs Indexing", ["php", "cpp", "generic"],
+                                  index=["php","cpp","generic"].index(lang) if lang in ("php","cpp","generic") else 2,
+                                  key="index_lang")
+
+    if st.button("Index aufbauen/aktualisieren", key="idx_go"):
+        if not repo_path.strip():
+            st.warning("Bitte Repo-Pfad angeben.")
+        else:
+            index_script = Path("index_cpp.py" if index_lang == "cpp" else "index_repo.py")
+            if not index_script.exists():
+                st.error(f"{index_script.name} nicht gefunden neben rag_ui.py.")
+            else:
+                # ollama ping
+                try:
+                    _ = ollama.embeddings(model="nomic-embed-text", prompt="ping")["embedding"]
+                except Exception as e:
+                    st.error(f"Embeddings nicht verfügbar (Ollama läuft/Modell geladen?): {e}")
+                    st.stop()
+
+                cmd_args = [
+                    "--repo", repo_path,
+                    "--db", str(Path(db_path)),
+                    "--project", project_name,
+                    "--lang", index_lang,
+                ]
+                st.info(f"Starte {index_script.name} …")
+                log_box = st.empty()
+                log_lines = []
+                for line in run_index_subprocess(sys.executable, index_script, cmd_args):
+                    log_lines.append(line)
+                    log_box.code("\n".join(log_lines[-200:]), language="text")
+                st.success("Indexing abgeschlossen. Öffne/wechsel die Collection oben, um sie zu verwenden.")
+
+# Kleiner Reset-Button (optional)
+st.sidebar.divider()
+if st.sidebar.button("🧹 Chat zurücksetzen"):
+    st.session_state.messages = []
+    st.session_state.last_ctx = ""
+    st.rerun()
