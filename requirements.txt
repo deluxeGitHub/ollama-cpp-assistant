@@ -1,0 +1,6 @@
+ollama
+chromadb
+tree_sitter
+tree_sitter_languages
+tqdm
+streamlit
