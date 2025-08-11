@@ -29,8 +29,7 @@ IGNORE_DIRS = {
 IGNORE_PATH_SUBSTRINGS = {
     "third_party/", "external/", "/_deps/", "vcpkg_installed/", "/.conan/",
 }
-IGNORE_FILE_EXT = {".min.cpp"}  # falls es sowas gibt – unwahrscheinlich, aber der Vollständigkeit halber
-
+IGNORE_FILE_EXT = {".min.cpp"}
 
 # ---------- Utils ----------
 def sanitize_meta(meta: dict) -> dict:
@@ -107,7 +106,6 @@ def safe_embed_docs(ids: List[str], docs: List[str], metas: List[Dict]) -> Tuple
                     pass
                 time.sleep(RETRY_SLEEP_SEC * (attempt + 1))
             if not emb:
-                # letzte Chance: stark verkürzt
                 short = piece[:2000]
                 try:
                     r = ollama.embeddings(model="nomic-embed-text", prompt=short)
@@ -123,16 +121,8 @@ def safe_embed_docs(ids: List[str], docs: List[str], metas: List[Dict]) -> Tuple
             out_embs.append(emb)
     return out_ids, out_docs, out_metas, out_embs
 
-
 # ---------- C++ Symbol Extraction ----------
-# Tree-sitter-Knotentypen (cpp):
-# - function_definition
-# - declaration (mit function_declarator)
-# - class_specifier / struct_specifier
-# - namespace_definition
-# - enum_specifier
 NAME_NODES = {"type_identifier", "field_identifier", "identifier", "namespace_identifier"}
-
 FUNC_SIG_RE = re.compile(r'([A-Za-z_][\w:]*)\s*\(', re.MULTILINE)
 
 def _node_text(code: str, n) -> str:
@@ -142,7 +132,6 @@ def _first_name_child_text(code: str, n) -> str:
     for c in n.children:
         if c.type in NAME_NODES:
             return _node_text(code, c)
-    # tiefer suchen (heuristik)
     for c in n.children:
         t = _first_name_child_text(code, c)
         if t:
@@ -150,7 +139,6 @@ def _first_name_child_text(code: str, n) -> str:
     return ""
 
 def extract_cpp_symbols(code: str) -> List[Dict]:
-    # 1) Tree-sitter
     try:
         lang: Language = get_language("cpp")
         parser = Parser()
@@ -163,7 +151,6 @@ def extract_cpp_symbols(code: str) -> List[Dict]:
         def walk(n, cls_or_ns: str | None = None):
             t = n.type
 
-            # Klassen/Structs
             if t in ("class_specifier", "struct_specifier"):
                 name = _first_name_child_text(code, n) or ""
                 meta = {
@@ -173,12 +160,10 @@ def extract_cpp_symbols(code: str) -> List[Dict]:
                     "end_line": n.end_point[0] + 1,
                 }
                 out.append({"text": _node_text(code, n), "meta": meta})
-                # Kinder durchlaufen (für Methoden)
                 for c in n.children:
                     walk(c, cls_or_ns=name or cls_or_ns)
-                return  # schon tiefer gelaufen
+                return
 
-            # Namespace
             if t == "namespace_definition":
                 name = _first_name_child_text(code, n) or ""
                 meta = {
@@ -192,7 +177,6 @@ def extract_cpp_symbols(code: str) -> List[Dict]:
                     walk(c, cls_or_ns=name or cls_or_ns)
                 return
 
-            # Funktionsdefinition (mit Body)
             if t == "function_definition":
                 name = _first_name_child_text(code, n) or ""
                 if cls_or_ns and name and "::" not in name:
@@ -205,10 +189,8 @@ def extract_cpp_symbols(code: str) -> List[Dict]:
                 }
                 out.append({"text": _node_text(code, n), "meta": meta})
 
-            # Deklarationen (z. B. Header-Prototypen)
             if t == "declaration":
                 txt = _node_text(code, n)
-                # Heuristik: nur „funktionsartige“ Deklarationen
                 if "(" in txt and ")" in txt and ";" in txt:
                     m = FUNC_SIG_RE.search(txt)
                     if m:
@@ -232,25 +214,18 @@ def extract_cpp_symbols(code: str) -> List[Dict]:
     except Exception:
         pass
 
-    # 2) Fallback: Regex & Chunking
     out: List[Dict] = []
-    # sehr grob: freie Funktionssignaturen
     for m in FUNC_SIG_RE.finditer(code):
-        s = code.rfind('\n', 0, m.start())
-        s = 0 if s < 0 else s + 1
-        e = code.find('\n{', m.end())
-        if e == -1:
-            e = code.find('\n;', m.end())
-        if e == -1:
-            e = min(len(code), s + 800)  # heuristischer cut
+        s = code.rfind('\n', 0, m.start()); s = 0 if s < 0 else s + 1
+        e = code.find('\n{', m.end());     e = e if e != -1 else code.find('\n;', m.end())
+        if e == -1: e = min(len(code), s + 800)
         text = code[s:e]
         start_line = code.count('\n', 0, s) + 1
-        end_line = code.count('\n', 0, e) + 1
+        end_line   = code.count('\n', 0, e) + 1
         out.append({"text": text, "meta": {"kind": "function", "name": m.group(1), "start_line": start_line, "end_line": end_line}})
     if out:
         return out
 
-    # 3) Zeilen-Chunking
     lines = code.splitlines()
     chunk = 120
     chunks: List[Dict] = []
@@ -259,16 +234,16 @@ def extract_cpp_symbols(code: str) -> List[Dict]:
         chunks.append({"text": text, "meta": {"kind": "chunk", "name": "", "start_line": i+1, "end_line": min(i+chunk, len(lines))}})
     return chunks
 
-
 # ---------- Main ----------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", required=True, help="Pfad zum C++-Repository")
     ap.add_argument("--db", required=True, help="Pfad zu ChromaDB (persist)")
-    ap.add_argument("--collection", default="cpp_repo", help="Chroma-Collection-Name")
+    ap.add_argument("--collection", default="cpp_repo", help="Collection-Name (Fallback)")
     ap.add_argument("--project", required=False, help="Projekt-/Collection-Name (z. B. 'afx')")
     ap.add_argument("--lang", default="cpp", choices=["php","cpp","generic"], help="Primärsprache des Projekts")
     args = ap.parse_args()
+
     collection_name = (args.project or args.collection or "cpp_repo")
 
     repo = Path(args.repo)
@@ -281,8 +256,6 @@ def main():
         metadata={"hnsw:space": "cosine", "project": args.project or collection_name, "lang": args.lang}
     )
 
-
-    # C++-Dateien sammeln
     cpp_files = [p for p in repo.rglob("*") if p.is_file() and not should_skip(p)]
     print(f"Indexiere {len(cpp_files)} C/C++-Dateien…")
 
@@ -291,7 +264,6 @@ def main():
             code = read_file(f)
             symbols = extract_cpp_symbols(code)
 
-            # Alte Chunks dieser Datei entfernen (inkrementell)
             coll.delete(where={"path": str(f)})
 
             ids, docs, metas = [], [], []
@@ -319,7 +291,6 @@ def main():
             print(f"[WARN] Fehler bei {f}: {e}")
 
     print("Fertig. ChromaDB gespeichert unter:", dbdir)
-
 
 if __name__ == "__main__":
     main()
