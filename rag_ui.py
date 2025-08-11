@@ -1,10 +1,13 @@
 import streamlit as st
 from pathlib import Path
+import subprocess
+import sys
+import textwrap
 import chromadb
 from chromadb.config import Settings
 import ollama
-import textwrap
 
+# ---------------- Prompt-Vorlagen ----------------
 LANG_PROMPTS = {
     "php": (
         "Du bist ein hilfsbereiter Senior-PHP-Entwickler. "
@@ -29,6 +32,7 @@ LANG_PROMPTS = {
     ),
 }
 
+# ---------------- Hilfsfunktionen ----------------
 def format_context(results, max_chars=12000, show_dist=False):
     if not results or not results.get("documents") or not results["documents"][0]:
         return ""
@@ -59,12 +63,26 @@ def auto_lang_from_meta(client, collection_name: str) -> str:
             return lang
     except Exception:
         pass
-    # Heuristik aus Name
     n = (collection_name or "").lower()
     if "php" in n: return "php"
     if "cpp" in n or "c++" in n or "cxx" in n: return "cpp"
     return "generic"
 
+def run_index_subprocess(python_exe: str, script_path: Path, args: list[str]):
+    """Startet den Indexer als Subprozess und streamt stdout/err."""
+    proc = subprocess.Popen(
+        [python_exe, str(script_path), *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    for line in proc.stdout:  # type: ignore
+        yield line.rstrip("\n")
+    proc.wait()
+    yield f"[Indexer beendet] Exit-Code: {proc.returncode}"
+
+# ---------------- UI Setup ----------------
 st.set_page_config(page_title="Ollama Code Assistant", page_icon="💬", layout="wide")
 st.title("💬 Code Assistant mit Ollama (RAG)")
 
@@ -97,18 +115,21 @@ with st.sidebar:
     model = st.selectbox("Antwort-Modell", ["deepseek-r1:8b", "gpt-oss:20b", "llama3.1:8b"], index=0)
     embed_model = st.text_input("Embeddings-Modell", value="nomic-embed-text")
 
-    topk = st.slider("Top-K Snippets", 1, 20, 8)
-    max_chars = st.slider("Max Kontext-Zeichen", 2000, 30000, 12000, step=1000)
+    topk = st.slider("Top-K Snippets", 1, 30, 20)
+    max_chars = st.slider("Max Kontext-Zeichen", 2000, 30000, 16000, step=1000)
     show_dist = st.checkbox("Ähnlichkeitswerte anzeigen", value=False)
     show_ctx_box = st.checkbox("Verwendete Snippets anzeigen", value=True)
 
+# Query-Eingabe
 frage = st.text_area("Frage zur Codebasis", placeholder="Wie wird das Login validiert?")
 
-col_run1, col_run2 = st.columns([1,1])
+col_run1, col_run2, col_run3 = st.columns([1,1,1])
 with col_run1:
     go = st.button("Antwort abrufen", type="primary")
 with col_run2:
     ping = st.button("Embeddings testen")
+with col_run3:
+    st.write("")  # spacer
 
 if ping:
     try:
@@ -117,6 +138,57 @@ if ping:
     except Exception as e:
         st.error(f"Embedding-Test fehlgeschlagen: {e}")
 
+# ---------------- Reindex-Sektion ----------------
+st.divider()
+st.subheader("🧱 Index neu aufbauen / aktualisieren")
+
+re_col1, re_col2, re_col3 = st.columns([2,1,1])
+with re_col1:
+    repo_path = st.text_input("Repo-Pfad (Ordner der Codebasis)", value="")
+with re_col2:
+    project_name = st.text_input("Projektname (Collection)", value=collection or "cpp_repo")
+with re_col3:
+    index_lang = st.selectbox("Sprache fürs Indexing", ["php", "cpp", "generic"],
+                              index=["php","cpp","generic"].index(lang) if lang in ("php","cpp","generic") else 2)
+
+idx_go = st.button("Index aufbauen/aktualisieren")
+
+if idx_go:
+    if not repo_path.strip():
+        st.warning("Bitte Repo-Pfad angeben.")
+    else:
+        # Entscheide, welchen Indexer wir starten
+        index_script = Path("index_cpp.py" if index_lang == "cpp" else "index_repo.py")
+        if not index_script.exists():
+            st.error(f"{index_script.name} nicht gefunden neben rag_ui.py.")
+        else:
+            # Vorab: Embeddings-Ping (nützlich, um sofortiges Hängen zu vermeiden)
+            try:
+                _ = ollama.embeddings(model="nomic-embed-text", prompt="ping")["embedding"]
+            except Exception as e:
+                st.error(f"Embeddings nicht verfügbar (Ollama läuft/Modell geladen?): {e}")
+                st.stop()
+
+            cmd_args = [
+                "--repo", repo_path,
+                "--db", str(Path(db_path)),
+                "--project", project_name,
+                "--lang", index_lang,
+            ]
+            # Falls du im PHP-Indexer noch --collection verwendest, ist --project vorrangig und setzt die Collection.
+
+            st.info(f"Starte {index_script.name} …")
+            log_box = st.empty()
+            log_lines = []
+
+            for line in run_index_subprocess(sys.executable, index_script, cmd_args):
+                log_lines.append(line)
+                # zeige nur die letzten ~200 Zeilen
+                log_box.code("\n".join(log_lines[-200:]), language="text")
+
+            st.success("Indexing abgeschlossen. Dropdown oben ggf. neu öffnen/wechseln, um die Collection zu sehen.")
+
+# ---------------- Frage ausführen ----------------
 if go:
     if not client:
         st.error("Keine Chroma-Verbindung.")
